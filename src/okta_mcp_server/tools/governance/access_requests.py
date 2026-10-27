@@ -20,6 +20,10 @@ governance API reference):
   configured org), and its ``after`` query value is surfaced as
   ``next_cursor`` for manual paging.
 - ``limit`` is forwarded unchanged; the server enforces its own bounds.
+
+A 401/403 returns ``{"error", "status", "errorCode", "errorSummary",
+"required_scopes"}``; the message names both possible causes (missing scope
+or missing Access Requests admin role on the service app).
 """
 
 import asyncio
@@ -33,7 +37,7 @@ from okta_mcp_server.server import mcp
 from okta_mcp_server.utils.client import get_okta_client
 from okta_mcp_server.utils.pagination import build_query_params, create_paginated_response
 from okta_mcp_server.utils.raw_request import okta_raw_request
-from okta_mcp_server.utils.scope_guard import require_scopes
+from okta_mcp_server.utils.scope_guard import MissingScopeError, require_scopes
 from okta_mcp_server.utils.serialization import json_response, none_body_error
 from okta_mcp_server.utils.validation import validate_ids
 
@@ -46,6 +50,40 @@ _TOP_LEVEL_CATALOG_FILTER = "not(parent pr)"
 #: Safety limits for fetch_all, mirroring paginate_all_results defaults.
 _GOVERNANCE_MAX_PAGES = 500
 _GOVERNANCE_PAGE_DELAY_SECONDS = 0.1
+
+
+def _governance_error(err: Any) -> Dict[str, Any]:
+    """Build the ``{"error": ...}`` result for a failed governance call.
+
+    A 401/403 on the governance API is not always a scope problem: the
+    service app also needs an admin role that covers Access Requests. So
+    unlike ``require_scopes``, this names both causes and includes Okta's
+    ``errorCode`` / ``errorSummary``.
+    """
+    if not isinstance(err, MissingScopeError):
+        return {"error": str(err)}
+
+    scopes = ", ".join(sorted(err.scopes))
+    okta_detail = f"HTTP {err.status}" + (f" {err.error_code}" if err.error_code else "")
+    if err.error_summary:
+        okta_detail += f": {err.error_summary}"
+    message = (
+        f"Okta denied the governance request ({okta_detail}). "
+        f"The cause may be a missing OAuth scope ({scopes}) OR a missing admin role on the "
+        "service app (e.g. Access Requests Administrator). To fix:\n"
+        f"1. Scope: add {scopes} to OKTA_SCOPES in your MCP client configuration and grant it to "
+        "your Okta API Services application (Admin Console → Applications → your app → Okta API Scopes).\n"
+        "2. Role: assign the service app an admin role that can read Access Requests, e.g. "
+        "Access Requests Administrator (Admin Console → Applications → your app → Admin roles).\n"
+        "Then re-authenticate and retry."
+    )
+    return {
+        "error": message,
+        "status": err.status,
+        "errorCode": err.error_code,
+        "errorSummary": err.error_summary,
+        "required_scopes": sorted(err.scopes),
+    }
 
 
 def _governance_url(path: str, params: Optional[Dict[str, Any]] = None) -> str:
@@ -95,7 +133,7 @@ async def _list_governance(ctx: Context, client, url: str, fetch_all: bool, what
     _, body, err = await okta_raw_request(client, "GET", url)
     if err:
         logger.error(f"Okta API error while listing {what}: {err}")
-        return {"error": str(err)}
+        return _governance_error(err)
 
     items, next_href = _split_page(body)
     next_url = _next_request_url(next_href)
@@ -123,7 +161,7 @@ async def _list_governance(ctx: Context, client, url: str, fetch_all: bool, what
         if page_err:
             logger.warning(f"Error fetching {what} page {pages_fetched + 1}: {page_err}")
             pagination_info["stopped_early"] = True
-            pagination_info["stop_reason"] = f"API error: {page_err}"
+            pagination_info["stop_reason"] = f"API error: {_governance_error(page_err)['error']}"
             break
 
         page_items, page_next_href = _split_page(page_body)
@@ -282,7 +320,7 @@ async def get_app_request_condition(ctx: Context, app_id: str, condition_id: str
         _, condition, err = await okta_raw_request(client, "GET", url)
         if err:
             logger.error(f"Okta API error while getting request condition {condition_id}: {err}")
-            return {"error": str(err)}
+            return _governance_error(err)
 
         if condition is None:
             return none_body_error(

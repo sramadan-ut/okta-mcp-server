@@ -92,12 +92,21 @@ class MissingScopeError(Exception):
 
     ``str(exc)`` is exactly the message ``build_scope_error`` produces, so a
     tool's usual ``return {"error": str(err)}`` yields the same payload as
-    ``require_scopes``.
+    ``require_scopes``. Okta's ``errorCode`` / ``errorSummary`` are kept on
+    the exception for callers that want to surface them.
     """
 
-    def __init__(self, scopes: list[str], status: Optional[int] = None):
+    def __init__(
+        self,
+        scopes: list[str],
+        status: Optional[int] = None,
+        error_code: Optional[str] = None,
+        error_summary: Optional[str] = None,
+    ):
         self.scopes = list(scopes)
         self.status = status
+        self.error_code = error_code
+        self.error_summary = error_summary
         super().__init__(_scope_error_message(self.scopes))
 
 

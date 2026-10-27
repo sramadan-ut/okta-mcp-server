@@ -41,6 +41,8 @@ async def okta_raw_request(
         When the executor reports HTTP 401/403 inside a ``@require_scopes``
         tool, ``error`` is a ``MissingScopeError`` for that tool's scopes, so
         ``{"error": str(error)}`` matches the decorator's own scope error.
+        Okta's ``errorCode`` / ``errorSummary`` are on the error when the
+        response carried them.
     """
     executor = client.get_request_executor()
     request, err = await executor.create_request(
@@ -59,5 +61,10 @@ def _as_scope_error(err: Any) -> Any:
     scopes = get_active_required_scopes()
     if status in _SCOPE_DENIED_STATUSES and scopes:
         logger.error(f"Okta API returned HTTP {status} — likely missing scope(s): {list(scopes)}")
-        return MissingScopeError(list(scopes), status=status)
+        return MissingScopeError(
+            list(scopes),
+            status=status,
+            error_code=getattr(err, "error_code", None) or None,
+            error_summary=getattr(err, "error_summary", None) or None,
+        )
     return err

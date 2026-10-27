@@ -47,11 +47,36 @@ def _make_ctx():
 
 
 class _HttpErr(Exception):
-    """Mimics okta.errors OktaAPIError/HTTPError: carries ``.status``."""
+    """Mimics okta.errors OktaAPIError: carries ``.status``, ``.error_code``
+    and ``.error_summary``. Pass ``error_code=None`` to mimic HTTPError,
+    which has no Okta error body."""
 
-    def __init__(self, status):
+    def __init__(
+        self,
+        status,
+        error_code="E0000006",
+        error_summary="You do not have permission to perform the requested action",
+    ):
         self.status = status
-        super().__init__(f"Okta HTTP {status} E0000006 You do not have permission")
+        if error_code is not None:
+            self.error_code = error_code
+            self.error_summary = error_summary
+        super().__init__(f"Okta HTTP {status} {error_code} {error_summary}")
+
+
+def _assert_governance_denied(result, status, scope, error_code="E0000006",
+                              error_summary="You do not have permission to perform the requested action"):
+    assert result["status"] == status
+    assert result["errorCode"] == error_code
+    assert result["errorSummary"] == error_summary
+    assert result["required_scopes"] == [scope]
+    message = result["error"]
+    if error_code:
+        assert f"HTTP {status} {error_code}: {error_summary}" in message
+    assert scope in message
+    assert "missing OAuth scope" in message
+    assert "OR a missing admin role" in message
+    assert "Access Requests Administrator" in message
 
 
 def _client_paged(pages):
@@ -330,16 +355,16 @@ class TestListCatalogEntries:
 # ---------------------------------------------------------------------------
 
 
-class TestScopeErrorFromRawRequest:
+class TestGovernanceForbidden:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("status", [401, 403])
     @patch(f"{GOV}.get_okta_client")
-    async def test_conditions_forbidden_matches_require_scopes(self, mock_get_client, status):
+    async def test_list_conditions_names_scope_and_role(self, mock_get_client, status):
         mock_get_client.return_value = _client_paged([(None, None, _HttpErr(status))])
 
         result = await list_app_request_conditions(ctx=_make_ctx(), app_id=APP_ID)
 
-        assert result == build_scope_error([CONDITION_SCOPE])
+        _assert_governance_denied(result, status, CONDITION_SCOPE)
 
     @pytest.mark.asyncio
     @patch(f"{GOV}.get_okta_client")
@@ -348,7 +373,7 @@ class TestScopeErrorFromRawRequest:
 
         result = await get_app_request_condition(ctx=_make_ctx(), app_id=APP_ID, condition_id="rc1")
 
-        assert result == build_scope_error([CONDITION_SCOPE])
+        _assert_governance_denied(result, 403, CONDITION_SCOPE)
 
     @pytest.mark.asyncio
     @patch(f"{GOV}.get_okta_client")
@@ -357,8 +382,53 @@ class TestScopeErrorFromRawRequest:
 
         result = await list_catalog_entries(ctx=_make_ctx())
 
-        assert result == build_scope_error([CATALOG_SCOPE])
+        _assert_governance_denied(result, 403, CATALOG_SCOPE)
 
+    @pytest.mark.asyncio
+    @patch(f"{GOV}.get_okta_client")
+    async def test_real_sdk_okta_api_error(self, mock_get_client):
+        from okta.errors.okta_api_error import OktaAPIError
+
+        details = MagicMock(status=403, headers={})
+        err = OktaAPIError(
+            "https://test.okta.com/governance/api/v2/catalogs/default/entries",
+            details,
+            {"errorCode": "E0000006", "errorSummary": "You do not have permission to perform the requested action"},
+        )
+        mock_get_client.return_value = _client_paged([(None, None, err)])
+
+        result = await list_catalog_entries(ctx=_make_ctx())
+
+        _assert_governance_denied(result, 403, CATALOG_SCOPE)
+
+    @pytest.mark.asyncio
+    @patch(f"{GOV}.get_okta_client")
+    async def test_without_okta_error_body(self, mock_get_client):
+        mock_get_client.return_value = _client_paged([(None, None, _HttpErr(401, error_code=None))])
+
+        result = await list_app_request_conditions(ctx=_make_ctx(), app_id=APP_ID)
+
+        _assert_governance_denied(result, 401, CONDITION_SCOPE, error_code=None, error_summary=None)
+        assert "(HTTP 401)" in result["error"]
+
+    @pytest.mark.asyncio
+    @patch(f"{GOV}._GOVERNANCE_PAGE_DELAY_SECONDS", 0)
+    @patch(f"{GOV}.get_okta_client")
+    async def test_forbidden_mid_walk_explains_in_stop_reason(self, mock_get_client):
+        base = f"/governance/api/v2/resources/{APP_ID}/request-conditions"
+        mock_get_client.return_value = _client_paged([
+            _page([ACTIVE], f"https://test.okta.com{base}?after=rc1"),
+            (None, None, _HttpErr(403)),
+        ])
+
+        result = await list_app_request_conditions(ctx=_make_ctx(), app_id=APP_ID, fetch_all=True)
+
+        assert [c["id"] for c in result["items"]] == ["rc1"]
+        reason = result["pagination_info"]["stop_reason"]
+        assert "E0000006" in reason and "Access Requests Administrator" in reason
+
+
+class TestScopeErrorFromRawRequest:
     @pytest.mark.asyncio
     @patch("okta_mcp_server.tools.applications.applications.get_okta_client")
     async def test_oin_catalog_uses_shared_helper(self, mock_get_client):
@@ -375,7 +445,7 @@ class TestScopeErrorFromRawRequest:
 
         result = await list_app_request_conditions(ctx=_make_ctx(), app_id=APP_ID)
 
-        assert result == {"error": "Okta HTTP 500 E0000006 You do not have permission"}
+        assert result == {"error": str(_HttpErr(500))}
 
     @pytest.mark.asyncio
     async def test_pre_call_scope_check_matches(self):

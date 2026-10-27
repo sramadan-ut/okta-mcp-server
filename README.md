@@ -761,6 +761,8 @@ The Okta Open Source MCP Server provides the following tools for LLMs to interac
 
 **Troubleshooting "I can't see the app under Request apps":** check the app is in the catalog with `list_catalog_entries`, then check its conditions with `list_app_request_conditions`. A condition only applies while it is `ACTIVE`. `INACTIVE` conditions are switched off, and `INVALID` conditions reference something that no longer exists (for example a deleted group) and need an admin to fix them.
 
+**Permission errors (401/403):** governance tools return Okta's `errorCode` and `errorSummary` along with the error. A 401/403 can mean either a missing OAuth scope or a missing admin role on the service app: the app also needs an admin role that can read Access Requests (for example **Access Requests Administrator**, under Admin Console → Applications → your app → Admin roles).
+
 **Paging:** governance lists page with `_links.next` in the response body rather than a `Link` header. Pass `fetch_all=True` to follow every page, or pass the returned `next_cursor` as `after`. `list_catalog_entries(app_name=...)` matches names client-side and always walks the whole catalog.
 
 ### Confirmation for Destructive Operations
