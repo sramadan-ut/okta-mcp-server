@@ -16,7 +16,7 @@ Design rationale
 - Real tools are pruned by ``prune_tools_by_scope`` when their scope is missing.
 - Without stubs, the LLM has no signal that the capability exists at all and says
   "I cannot do that" with no actionable guidance.
-- One stub *per scope group* (≤17 stubs maximum) keeps the tool list short while
+- One stub *per scope group* (one per distinct scope in the registry) keeps the tool list short while
   giving the LLM enough information to explain exactly what is missing and how to
   fix it.
 - Stubs are registered only for *missing* scopes — servers with all scopes loaded
@@ -44,15 +44,17 @@ def _scope_to_stub_name(scope: str) -> str:
 
     Examples::
 
-        'okta.brands.read'          → 'brands_read_scope_info'
-        'okta.deviceAssurance.read' → 'device_assurance_read_scope_info'
-        'okta.emailDomains.manage'  → 'email_domains_manage_scope_info'
+        'okta.brands.read'                    → 'brands_read_scope_info'
+        'okta.deviceAssurance.read'           → 'device_assurance_read_scope_info'
+        'okta.emailDomains.manage'            → 'email_domains_manage_scope_info'
+        'okta.accessRequests.catalog.read'    → 'access_requests_catalog_read_scope_info'
+        'okta.accessRequests.condition.read'  → 'access_requests_condition_read_scope_info'
+
+    Every part after the leading ``okta`` is kept, so scopes that share a
+    resource but differ in a sub-resource can't collide.
     """
-    parts = scope.split(".")
-    resource = parts[1]   # e.g. 'deviceAssurance'
-    access = parts[2]     # e.g. 'read'
-    resource_snake = re.sub(r"(?<!^)(?=[A-Z])", "_", resource).lower()
-    return f"{resource_snake}_{access}_scope_info"
+    parts = scope.split(".")[1:]  # drop the leading 'okta'
+    return "_".join(re.sub(r"(?<!^)(?=[A-Z])", "_", part).lower() for part in parts) + "_scope_info"
 
 
 def _build_stub_description(scope: str, tools: list[str]) -> str:

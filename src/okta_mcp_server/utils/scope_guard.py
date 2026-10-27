@@ -26,6 +26,7 @@ It has three responsibilities:
     LLM never sees tools it cannot call.
 """
 
+import contextvars
 import functools
 import inspect
 from typing import Any, Optional
@@ -84,6 +85,32 @@ def build_scope_error(scopes: list[str], return_type: str = "dict") -> Any:
     if return_type == "list":
         return [{"error": msg}]
     return {"error": msg}
+
+
+class MissingScopeError(Exception):
+    """An HTTP 401/403 from Okta, re-expressed as the canonical scope error.
+
+    ``str(exc)`` is exactly the message ``build_scope_error`` produces, so a
+    tool's usual ``return {"error": str(err)}`` yields the same payload as
+    ``require_scopes``.
+    """
+
+    def __init__(self, scopes: list[str], status: Optional[int] = None):
+        self.scopes = list(scopes)
+        self.status = status
+        super().__init__(_scope_error_message(self.scopes))
+
+
+#: Scopes declared by the ``require_scopes`` wrapper currently executing, so
+#: helpers that issue raw requests can map a 401/403 to the same scope error.
+_ACTIVE_REQUIRED_SCOPES: contextvars.ContextVar[tuple] = contextvars.ContextVar(
+    "okta_mcp_active_required_scopes", default=()
+)
+
+
+def get_active_required_scopes() -> tuple:
+    """Return the scopes required by the tool currently running (empty outside a tool)."""
+    return _ACTIVE_REQUIRED_SCOPES.get()
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +213,7 @@ def require_scopes(*required_scopes: str, error_return_type: str = "dict"):
                         return build_scope_error(missing, error_return_type)
 
             # --- Execute tool body with exception guard -----------------------
+            token = _ACTIVE_REQUIRED_SCOPES.set(tuple(required_scopes))
             try:
                 return await fn(*args, **kwargs)
             except (ForbiddenException, UnauthorizedException) as exc:
@@ -195,6 +223,8 @@ def require_scopes(*required_scopes: str, error_return_type: str = "dict"):
                     f"likely missing scope(s): {list(required_scopes)}"
                 )
                 return build_scope_error(list(required_scopes), error_return_type)
+            finally:
+                _ACTIVE_REQUIRED_SCOPES.reset(token)
 
         return wrapper
     return decorator

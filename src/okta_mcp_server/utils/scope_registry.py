@@ -16,6 +16,7 @@ tool name to the minimum OAuth 2.0 scope required to call it.  It is used by:
 Scope naming convention:
     ``okta.<resource>.read``    — GET operations (read-only).
     ``okta.<resource>.manage``  — POST / PUT / DELETE operations (write).
+    Some scopes add a sub-resource, e.g. ``okta.accessRequests.catalog.read``.
     A token with ``*.manage`` implicitly covers ``*.read`` for the same resource.
 
 Reference: https://developer.okta.com/docs/api/oauth2
@@ -180,4 +181,11 @@ TOOL_SCOPE_REGISTRY: dict[str, str] = {
     "replace_email_domain":                 "okta.emailDomains.manage",
     "delete_email_domain":                  "okta.emailDomains.manage",
     "verify_email_domain":                  "okta.emailDomains.manage",
+    # ------------------------------------------------------------------
+    # Governance — Access Requests (read-only)
+    # (src/okta_mcp_server/tools/governance/access_requests.py)
+    # ------------------------------------------------------------------
+    "list_app_request_conditions":          "okta.accessRequests.condition.read",
+    "get_app_request_condition":            "okta.accessRequests.condition.read",
+    "list_catalog_entries":                 "okta.accessRequests.catalog.read",
 }

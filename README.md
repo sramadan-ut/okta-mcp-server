@@ -747,6 +747,22 @@ The Okta Open Source MCP Server provides the following tools for LLMs to interac
 | `delete_email_domain` | Delete an email domain (prompts for confirmation) | - `Remove the old email domain` |
 | `verify_email_domain` | Trigger email domain DNS verification | - `Verify the DNS records for mail.example.com` |
 
+### Governance (Access Requests)
+
+> **Required scope:** `okta.accessRequests.condition.read` (request conditions) · `okta.accessRequests.catalog.read` (catalog)
+>
+> Requires Okta Identity Governance. These tools are **read-only** and call the `/governance/api/v2` API.
+
+| Tool | Description | Usage Examples |
+| ---- | ----------- | -------------- |
+| `list_app_request_conditions` | List an app's Access Requests conditions, with a count per status (`ACTIVE`, `INACTIVE`, `INVALID`) | - `Why can't Jane see Salesforce under Request apps?` <br> - `Which request conditions on the Slack app are invalid?` |
+| `get_app_request_condition` | Get one request condition (audience, access scope, approval sequence) | - `Who approves requests from the Engineers condition on GitHub?` |
+| `list_catalog_entries` | List top-level apps in the Access Requests catalog, optionally matched by name | - `Is Workday requestable?` <br> - `List every app users can request` |
+
+**Troubleshooting "I can't see the app under Request apps":** check the app is in the catalog with `list_catalog_entries`, then check its conditions with `list_app_request_conditions`. A condition only applies while it is `ACTIVE`. `INACTIVE` conditions are switched off, and `INVALID` conditions reference something that no longer exists (for example a deleted group) and need an admin to fix them.
+
+**Paging:** governance lists page with `_links.next` in the response body rather than a `Link` header. Pass `fetch_all=True` to follow every page, or pass the returned `next_cursor` as `after`. `list_catalog_entries(app_name=...)` matches names client-side and always walks the whole catalog.
+
 ### Confirmation for Destructive Operations
 
 All destructive operations (deleting groups, applications, policies, policy rules, device assurance policies, and deactivating/deleting users) use the **[MCP Elicitation API](https://modelcontextprotocol.io/specification/2025-06-18/client/elicitation)** to prompt the user for explicit confirmation before proceeding.
@@ -788,6 +804,8 @@ The Okta Open Source MCP Server uses a **scope-based tool loading** mechanism to
 | `okta.domains.manage` | `create_custom_domain`, `replace_custom_domain`, `delete_custom_domain`, `upsert_custom_domain_certificate`, `verify_custom_domain` |
 | `okta.emailDomains.read` | `list_email_domains`, `get_email_domain` |
 | `okta.emailDomains.manage` | `create_email_domain`, `replace_email_domain`, `delete_email_domain`, `verify_email_domain` |
+| `okta.accessRequests.condition.read` | `list_app_request_conditions`, `get_app_request_condition` |
+| `okta.accessRequests.catalog.read` | `list_catalog_entries` |
 
 ### What you need to do
 
