@@ -1,0 +1,58 @@
+name: Sync with Okta upstream
+
+on:
+  schedule:
+    - cron: "0 15 * * 1"   # Mondays, 15:00 UTC
+  workflow_dispatch:        # lets you run it manually
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Mirror Okta's main into our main
+        run: gh repo sync ${{ github.repository }} --branch main
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ut-main
+          fetch-depth: 0
+
+      - name: Merge upstream into a sync branch
+        id: merge
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          if git merge-base --is-ancestor origin/main HEAD; then
+            echo "Already up to date."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          BRANCH="sync/upstream-$(date +%Y-%m-%d)"
+          git checkout -b "$BRANCH"
+          git merge origin/main --no-edit
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - uses: astral-sh/setup-uv@v6
+        if: steps.merge.outputs.changed == 'true'
+
+      - name: Run tests
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          uv sync
+          uv run pytest -q
+
+      - name: Open pull request
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          git push origin "${{ steps.merge.outputs.branch }}"
+          gh pr create --base ut-main --head "${{ steps.merge.outputs.branch }}" \
+            --title "Sync with Okta upstream ($(date +%Y-%m-%d))" \
+            --body "Merges the latest okta/okta-mcp-server main into ut-main. Tests passed. Review the upstream changes, merge, then update the commit ID in the Runlayer manifest."
