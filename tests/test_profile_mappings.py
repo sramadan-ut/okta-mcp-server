@@ -7,12 +7,21 @@
 
 """Tests for okta_mcp_server.tools.governance.profile_mappings (logic only, no network)."""
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
 from okta_mcp_server.tools.governance import profile_mappings as pm
+
+
+@pytest.fixture(autouse=True)
+def _clear_caches():
+    pm._clear_caches()
+    yield
+    pm._clear_caches()
+
 
 MAPPINGS = [
     {
@@ -152,3 +161,140 @@ async def test_last_page_with_headers_does_not_use_after_fallback(monkeypatch):
     _items, info = await pm._get_all(SimpleNamespace(info=AsyncMock()), object(), "/api/v1/apps?limit=200", "apps")
     assert len(calls) == 1
     assert info["stopped_early"] is False
+
+
+# ---------------------------------------------------------------------------
+# Resumability: time budget, cache, 429, app_name
+# ---------------------------------------------------------------------------
+
+MANY_MAPPINGS = [
+    {
+        "id": f"prm{i}",
+        "source": {"id": "oty1", "name": "user", "type": "user"},
+        "target": {"id": f"0oa{i}", "name": f"app{i}", "type": "appuser"},
+    }
+    for i in range(40)
+]
+
+
+def slow_request(calls, detail_delay=0.05):
+    """Fake okta_raw_request: every detail reads user.Team and takes ``detail_delay`` seconds."""
+
+    async def _req(client, method, url):
+        calls.append(url)
+        resp = SimpleNamespace(headers={})
+        if url.startswith("/api/v1/mappings/"):
+            await asyncio.sleep(detail_delay)
+            return resp, {"properties": {"team": {"expression": "user.Team"}}}, None
+        if url.startswith("/api/v1/mappings"):
+            return resp, MANY_MAPPINGS, None
+        if url.startswith("/api/v1/apps"):
+            return resp, APPS, None
+        raise AssertionError(url)
+
+    return _req
+
+
+def _detail_calls(calls):
+    return [c for c in calls if c.startswith("/api/v1/mappings/")]
+
+
+@pytest.mark.asyncio
+async def test_budget_expiry_returns_partial_then_second_call_completes_from_cache(monkeypatch):
+    calls = []
+    monkeypatch.setattr(pm, "okta_raw_request", slow_request(calls))
+    ctx = SimpleNamespace(info=AsyncMock())
+
+    # 40 details x 0.05s / 6 workers ~ 0.35s, so a 0.12s budget cannot finish.
+    first = await pm._scan(ctx, object(), ["Team"], max_seconds=0.12)
+    assert first["complete"] is False
+    assert first["mappings_remaining"] > 0
+    assert first["mappings_checked"] + first["mappings_remaining"] == len(MANY_MAPPINGS)
+    assert "call find_profile_attribute_usage again with the same arguments" in first["message"]
+    assert first["errors"] == []
+    # Matches cover everything fetched so far.
+    assert len(first["apps_by_attribute"]["Team"]) == first["mappings_checked"]
+    first_detail_calls = len(_detail_calls(calls))
+
+    calls.clear()
+    second = await pm._scan(ctx, object(), ["Team"], max_seconds=10)
+    assert second["complete"] is True
+    assert second["mappings_remaining"] == 0
+    assert second["mappings_from_cache"] == first["mappings_checked"]
+    assert "message" not in second
+    assert len(second["apps_by_attribute"]["Team"]) == len(MANY_MAPPINGS)
+    # Only uncached details were fetched; the apps list came from the cache.
+    assert len(_detail_calls(calls)) == first["mappings_remaining"]
+    assert first_detail_calls + len(_detail_calls(calls)) <= len(MANY_MAPPINGS) + pm._DETAIL_CONCURRENCY
+    assert not any(c.startswith("/api/v1/apps") for c in calls)
+    assert second["saml_apps_from_cache"] is True
+
+
+@pytest.mark.asyncio
+async def test_cache_expires_after_ttl(monkeypatch):
+    calls = []
+    monkeypatch.setattr(pm, "okta_raw_request", slow_request(calls, detail_delay=0))
+    ctx = SimpleNamespace(info=AsyncMock())
+    await pm._scan(ctx, object(), ["Team"])
+    for key, (ts, detail) in list(pm._DETAIL_CACHE.items()):
+        pm._DETAIL_CACHE[key] = (ts - pm._CACHE_TTL_SECONDS - 1, detail)
+    pm._APPS_CACHE["fetched_at"] -= pm._CACHE_TTL_SECONDS + 1
+
+    calls.clear()
+    result = await pm._scan(ctx, object(), ["Team"])
+    assert result["mappings_from_cache"] == 0
+    assert len(_detail_calls(calls)) == len(MANY_MAPPINGS)
+    assert any(c.startswith("/api/v1/apps") for c in calls)
+
+
+@pytest.mark.asyncio
+async def test_429_stops_fetching_and_returns_partial(monkeypatch):
+    calls = []
+    rate_limited = SimpleNamespace(status=429, error_code="E0000047", error_summary="API call exceeded rate limit")
+
+    def _req(client, method, url):
+        calls.append(url)
+        resp = SimpleNamespace(headers={})
+        if url.startswith("/api/v1/mappings/"):
+            return None, None, rate_limited
+        if url.startswith("/api/v1/mappings"):
+            return resp, MANY_MAPPINGS, None
+        return resp, APPS, None
+
+    monkeypatch.setattr(pm, "okta_raw_request", AsyncMock(side_effect=_req))
+    result = await pm._scan(SimpleNamespace(info=AsyncMock()), object(), ["Team", "timeType"])
+
+    assert result["complete"] is False
+    assert len(_detail_calls(calls)) <= pm._DETAIL_CONCURRENCY
+    assert result["mappings_remaining"] == len(MANY_MAPPINGS)
+    assert len([e for e in result["errors"] if "429" in e]) == 1
+    assert "rate-limited" in result["message"]
+    # SAML results are still returned.
+    assert result["apps_by_attribute"]["timeType"] == ["Expel.io"]
+
+
+def test_is_rate_limited_variants():
+    assert pm._is_rate_limited(SimpleNamespace(status=429))
+    assert pm._is_rate_limited(Exception("429 response must have the 'X-Rate-Limit-Reset' and 'Date' headers"))
+    assert not pm._is_rate_limited(SimpleNamespace(status=404))
+
+
+@pytest.mark.asyncio
+async def test_app_name_filters_mappings_and_saml_before_fetching(monkeypatch):
+    request = fake_request()
+    monkeypatch.setattr(pm, "okta_raw_request", request)
+    ctx = SimpleNamespace(info=AsyncMock())
+
+    slack = await pm._scan(ctx, object(), ["Team", "timeType"], app_name="SLA")
+    urls = [c.args[2] for c in request.call_args_list]
+    assert [u for u in urls if u.startswith("/api/v1/mappings/")] == ["/api/v1/mappings/prm1"]
+    assert slack["mappings_total"] == 1
+    assert {r["app"] for r in slack["matches"]} == {"Slack"}
+    assert slack["complete"] is True
+
+    request.reset_mock()
+    expel = await pm._scan(ctx, object(), ["Team", "timeType"], app_name="expel")
+    urls = [c.args[2] for c in request.call_args_list]
+    assert not any(u.startswith("/api/v1/mappings/") for u in urls)
+    assert {r["via"] for r in expel["matches"]} == {"saml_attribute_statement"}
+    assert expel["apps_by_attribute"] == {"Team": [], "timeType": ["Expel.io"]}
