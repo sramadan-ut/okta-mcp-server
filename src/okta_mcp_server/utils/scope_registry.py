@@ -188,4 +188,9 @@ TOOL_SCOPE_REGISTRY: dict[str, str] = {
     "list_app_request_conditions":          "okta.accessRequests.condition.read",
     "get_app_request_condition":            "okta.accessRequests.condition.read",
     "list_catalog_entries":                 "okta.accessRequests.catalog.read",
+    # ------------------------------------------------------------------
+    # Profile Mappings (read-only; the tool also requires okta.apps.read)
+    # (src/okta_mcp_server/tools/governance/profile_mappings.py)
+    # ------------------------------------------------------------------
+    "find_profile_attribute_usage":         "okta.profileMappings.read",
 }

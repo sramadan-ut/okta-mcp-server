@@ -602,6 +602,7 @@ The Okta Open Source MCP Server provides the following tools for LLMs to interac
 | `list_catalog_apps`           | Browse the OIN app catalog (find an app's `name` + features) | - `Find a SCIM 2.0 test app in the catalog` <br> - `Search the OIN catalog for Slack`                                                                        |
 | `get_catalog_app`             | Get a single OIN catalog app definition (incl. schema) | - `Show the catalog definition for the SCIM 2.0 test app`                                                                                                    |
 | `install_oin_app`             | Install an instance of an OIN catalog app (e.g. a provisioning-capable SCIM app) | - `Install the SCIM 2.0 test app as "HR Directory Sync"` <br> - `Add the Slack OIN app to my org`                                                            |
+| `find_profile_attribute_usage` | Find which apps read or write given Okta user profile attributes (profile mappings and SAML attribute statements). Requires `okta.profileMappings.read` **and** `okta.apps.read` | - `Which apps use the Team attribute?` <br> - `What breaks if I delete timeType?` <br> - `Which app populates department?` |
 
 ### Policies
 
@@ -808,6 +809,7 @@ The Okta Open Source MCP Server uses a **scope-based tool loading** mechanism to
 | `okta.emailDomains.manage` | `create_email_domain`, `replace_email_domain`, `delete_email_domain`, `verify_email_domain` |
 | `okta.accessRequests.condition.read` | `list_app_request_conditions`, `get_app_request_condition` |
 | `okta.accessRequests.catalog.read` | `list_catalog_entries` |
+| `okta.profileMappings.read` | `find_profile_attribute_usage` (also needs `okta.apps.read`) |
 
 ### What you need to do
 
