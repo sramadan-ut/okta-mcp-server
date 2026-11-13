@@ -21,15 +21,28 @@ Paging (management API, ``/api/v1``):
   so the bearer token only ever goes to the configured org.
 
 Resumability: there is one ``GET /api/v1/mappings/{id}`` per Okta<->app
-mapping, which can outlast the MCP client's ~100s timeout in large orgs. Each
-call has a time budget, mapping details and the apps list are cached in memory
-for 30 minutes, and a partial result tells the caller to call again. An HTTP
-429 stops the scan instead of retrying in a loop.
+mapping, which can outlast the MCP client's ~100s timeout in large orgs, and
+some MCP proxies start a fresh server process per tool call. So the tool is
+stateless: each call has a time budget and returns an opaque ``next_cursor``
+that records the phase (``mappings`` then ``saml``) and the last processed
+id. Mapping candidates are sorted by id so the order is the same in every
+process. Mapping details are also cached in memory and in a per-org JSON file
+under /tmp for 30 minutes, purely as a speedup: results never depend on the
+cache. An HTTP 429 stops the call instead of retrying in a loop.
 """
 
 import asyncio
+import base64
+import binascii
+import bisect
+import hashlib
+import json
+import os
 import re
+import stat
+import tempfile
 import time
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import parse_qs, urlencode, urlparse
 
@@ -53,33 +66,32 @@ _DETAIL_CONCURRENCY = 6
 _DEFAULT_MAX_SECONDS = 60.0
 _MAX_SECONDS_CAP = 80.0
 
-#: How long cached mapping details and the apps list are reused.
+#: How long cached mapping details are reused (memory and disk).
 _CACHE_TTL_SECONDS = 30 * 60
+#: Directory for the per-org mapping detail cache file.
+_DISK_CACHE_DIR = Path("/tmp")
+
+_CURSOR_VERSION = 1
+_PHASE_MAPPINGS = "mappings"
+_PHASE_SAML = "saml"
+_PHASE_DONE = "done"
 
 _LINK_NEXT_RE = re.compile(r'<([^>]+)>\s*;\s*rel="?next"?')
 
 # ---------------------------------------------------------------------------
-# Caches (module-level, in-memory, per server process / configured org)
+# Mapping detail cache: a speedup only, never needed for correctness
 # ---------------------------------------------------------------------------
 
-#: mapping id -> (fetched_at monotonic seconds, GET /api/v1/mappings/{id} body)
+#: mapping id -> (fetched_at wall-clock seconds, GET /api/v1/mappings/{id} body)
 _DETAIL_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
-#: Full, unfiltered GET /api/v1/apps list: {"fetched_at": float, "apps": [...]}
-_APPS_CACHE: Dict[str, Any] = {}
 
 
 def _clear_caches() -> None:
     _DETAIL_CACHE.clear()
-    _APPS_CACHE.clear()
 
 
 def _is_fresh(fetched_at: float, now: float) -> bool:
-    return now - fetched_at < _CACHE_TTL_SECONDS
-
-
-def _prune_detail_cache(now: float) -> None:
-    for mapping_id in [k for k, (ts, _) in _DETAIL_CACHE.items() if not _is_fresh(ts, now)]:
-        del _DETAIL_CACHE[mapping_id]
+    return 0 <= now - fetched_at < _CACHE_TTL_SECONDS
 
 
 def _cached_detail(mapping_id: Any, now: float) -> Optional[Dict[str, Any]]:
@@ -89,18 +101,110 @@ def _cached_detail(mapping_id: Any, now: float) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _cached_apps(now: float) -> Optional[List[Dict[str, Any]]]:
-    if _APPS_CACHE and _is_fresh(_APPS_CACHE["fetched_at"], now):
-        return _APPS_CACHE["apps"]
-    return None
+def _disk_cache_path(org_url: str) -> Path:
+    digest = hashlib.sha256(org_url.rstrip("/").lower().encode()).hexdigest()[:16]
+    return _DISK_CACHE_DIR / f"okta-mcp-profile-mapping-details-{digest}.json"
 
 
-def _is_rate_limited(err: Any) -> bool:
-    """True for an Okta HTTP 429, after the SDK's own retries are used up."""
-    if getattr(err, "status", None) == 429 or getattr(err, "error_code", None) == "E0000047":
-        return True
-    # The SDK returns a plain Exception when a 429 lacks X-Rate-Limit-Reset / Date.
-    return str(err).startswith("429 ")
+def _load_disk_cache(path: Path, now: float) -> int:
+    """Merge fresh entries from ``path`` into the memory cache. Returns how many were added.
+
+    Only reads a regular file owned by the current user (no symlinks), so
+    another local user can't plant mapping details. Any error is ignored.
+    """
+    added = 0
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, encoding="utf-8") as f:
+            st = os.fstat(f.fileno())
+            if not stat.S_ISREG(st.st_mode) or (hasattr(os, "getuid") and st.st_uid != os.getuid()):
+                return 0
+            data = json.load(f)
+        for mapping_id, (fetched_at, detail) in (data.get("entries") or {}).items():
+            fetched_at = float(fetched_at)
+            current = _DETAIL_CACHE.get(mapping_id)
+            if isinstance(detail, dict) and _is_fresh(fetched_at, now) and (not current or current[0] < fetched_at):
+                _DETAIL_CACHE[mapping_id] = (fetched_at, detail)
+                added += 1
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.debug(f"Ignoring unreadable profile mapping cache {path}: {type(e).__name__}: {e}")
+    return added
+
+
+def _save_disk_cache(path: Path, now: float) -> None:
+    """Atomically write fresh memory-cache entries (merged with the file) to ``path``. Errors are ignored."""
+    tmp_name = None
+    try:
+        _load_disk_cache(path, now)  # keep entries other processes wrote meanwhile
+        entries = {k: [ts, d] for k, (ts, d) in _DETAIL_CACHE.items() if _is_fresh(ts, now)}
+        fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")  # mode 0600
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "entries": entries}, f, separators=(",", ":"))
+        os.replace(tmp_name, path)
+        tmp_name = None
+    except Exception as e:
+        logger.debug(f"Could not write profile mapping cache {path}: {type(e).__name__}: {e}")
+    finally:
+        if tmp_name:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Cursor
+# ---------------------------------------------------------------------------
+
+
+class _CursorError(ValueError):
+    pass
+
+
+def _args_fingerprint(attributes: List[str], include_saml: bool, app_name: Optional[str]) -> str:
+    raw = json.dumps([sorted(attributes), bool(include_saml), (app_name or "").strip().lower()])
+    return hashlib.sha256(raw.encode()).hexdigest()[:12]
+
+
+def _new_cursor_state(fingerprint: str) -> Dict[str, Any]:
+    return {
+        "v": _CURSOR_VERSION,
+        "args": fingerprint,
+        "phase": _PHASE_MAPPINGS,
+        "after": None,
+        "checked": 0,
+        "failed": 0,
+    }
+
+
+def _encode_cursor(state: Dict[str, Any]) -> str:
+    raw = json.dumps(state, separators=(",", ":"), sort_keys=True).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _decode_cursor(cursor: str, fingerprint: str) -> Dict[str, Any]:
+    try:
+        raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+        state = json.loads(raw)
+    except (binascii.Error, ValueError, UnicodeDecodeError) as e:
+        raise _CursorError("Invalid cursor: pass next_cursor exactly as returned by the previous call.") from e
+    if (
+        not isinstance(state, dict)
+        or state.get("v") != _CURSOR_VERSION
+        or state.get("phase") not in (_PHASE_MAPPINGS, _PHASE_SAML)
+        or not isinstance(state.get("after"), (str, type(None)))
+        or not isinstance(state.get("checked"), int)
+        or not isinstance(state.get("failed"), int)
+    ):
+        raise _CursorError("Invalid cursor: pass next_cursor exactly as returned by the previous call.")
+    if state.get("args") != fingerprint:
+        raise _CursorError(
+            "This cursor belongs to a scan with different arguments. Pass the same attributes, "
+            "include_saml and app_name as the call that returned it, or omit cursor to start over."
+        )
+    return state
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +229,14 @@ def _error_result(err: Any) -> Dict[str, Any]:
         "errorSummary": err.error_summary,
         "required_scopes": sorted(err.scopes),
     }
+
+
+def _is_rate_limited(err: Any) -> bool:
+    """True for an Okta HTTP 429, after the SDK's own retries are used up."""
+    if getattr(err, "status", None) == 429 or getattr(err, "error_code", None) == "E0000047":
+        return True
+    # The SDK returns a plain Exception when a 429 lacks X-Rate-Limit-Reset / Date.
+    return str(err).startswith("429 ")
 
 
 def _mgmt_url(path: str, params: Optional[Dict[str, Any]] = None) -> str:
@@ -187,6 +299,13 @@ def _next_from_link_header(response: Any) -> Tuple[bool, Optional[str]]:
         for match in _LINK_NEXT_RE.finditer(value):
             return True, _safe_next_url(match.group(1))
     return True, None
+
+
+def _has_next_page(response: Any, page: List[Any]) -> bool:
+    has_headers, next_url = _next_from_link_header(response)
+    if has_headers:
+        return next_url is not None
+    return len(page) >= _PAGE_LIMIT
 
 
 def _with_after(url: str, after: str) -> str:
@@ -338,53 +457,192 @@ def _app_name_matches(needle: Optional[str], *names: Any) -> bool:
     return not needle or any(needle in str(n or "").lower() for n in names)
 
 
-async def _fetch_details(
-    client, to_fetch: List[Dict[str, Any]], deadline: float, errors: List[str]
-) -> Tuple[bool, bool]:
-    """Fetch and cache mapping details until done, the deadline passes, or Okta returns 429.
+# ---------------------------------------------------------------------------
+# Phase 1: profile mappings
+# ---------------------------------------------------------------------------
 
-    Workers stop starting new requests once the deadline passes; a request
-    still in flight at the deadline is cancelled and left for the next call.
-    Returns (timed_out, rate_limited).
+
+async def _fetch_mapping_details(
+    client, pending: List[Dict[str, Any]], deadline: float
+) -> Tuple[Dict[int, Tuple[str, Any]], Dict[str, Any]]:
+    """Resolve ``pending`` mappings in order until done, the deadline passes, or Okta returns 429.
+
+    Workers take items strictly in list order. Cached items resolve without a
+    request (even past the deadline); uncached ones are only started before
+    the deadline, and a request still in flight at the deadline is cancelled.
+    Returns ({index: (kind, payload)}, stats) with kind one of ``ok`` (payload
+    = detail), ``forbidden``, ``gone`` or ``failed`` (payload = error).
     """
-    queue = iter(to_fetch)
-    state = {"timed_out": False, "rate_limited": False}
+    resolved: Dict[int, Tuple[str, Any]] = {}
+    stats: Dict[str, Any] = {"next": 0, "timed_out": False, "rate_limited": False, "fetched": 0, "from_cache": 0}
 
     async def worker() -> None:
-        while not state["rate_limited"]:
+        while not stats["rate_limited"]:
+            i = stats["next"]
+            if i >= len(pending):
+                return
+            mapping_id = pending[i].get("id")
+            cached = _cached_detail(mapping_id, time.time())
+            if cached is not None:
+                stats["next"] += 1
+                stats["from_cache"] += 1
+                resolved[i] = ("ok", cached)
+                continue
             left = deadline - time.monotonic()
             if left <= 0:
-                state["timed_out"] = True
+                stats["timed_out"] = True
                 return
-            summary = next(queue, None)
-            if summary is None:
-                return
-            mapping_id = summary.get("id")
+            stats["next"] += 1
             try:
                 _, detail, err = await asyncio.wait_for(
                     okta_raw_request(client, "GET", _mgmt_url(f"/mappings/{mapping_id}")), timeout=left
                 )
             except asyncio.TimeoutError:
-                state["timed_out"] = True
+                stats["timed_out"] = True
                 return
+            stats["fetched"] += 1
             if err:
                 if _is_rate_limited(err):
-                    if not state["rate_limited"]:
-                        errors.append(
-                            "Okta rate limit hit (HTTP 429) while reading mapping details; stopped early. "
-                            "Wait about a minute, then call again with the same arguments to continue."
-                        )
-                    state["rate_limited"] = True
+                    stats["rate_limited"] = True
                     return
-                errors.append(f"mapping {mapping_id}: {_error_result(err)['error']}")
+                status = getattr(err, "status", None)
+                resolved[i] = (
+                    ("forbidden", err) if status == 403 else ("gone", err) if status == 404 else ("failed", err)
+                )
                 continue
             if not isinstance(detail, dict):
-                errors.append(f"mapping {mapping_id}: empty body")
+                resolved[i] = ("failed", "empty response body")
                 continue
-            _DETAIL_CACHE[mapping_id] = (time.monotonic(), detail)
+            _DETAIL_CACHE[mapping_id] = (time.time(), detail)
+            resolved[i] = ("ok", detail)
 
     await asyncio.gather(*(worker() for _ in range(_DETAIL_CONCURRENCY)))
-    return state["timed_out"], state["rate_limited"]
+    return resolved, stats
+
+
+async def _mappings_phase(
+    ctx: Context,
+    client,
+    state: Dict[str, Any],
+    needle: Optional[str],
+    pattern: re.Pattern,
+    wanted: set,
+    deadline: float,
+    org_url: Optional[str],
+    out: Dict[str, Any],
+) -> bool:
+    """Process mapping candidates after ``state["after"]``. Updates ``state`` and ``out``; returns True when done."""
+    mappings, info = await _get_all(
+        ctx, client, _mgmt_url("/mappings", {"limit": _PAGE_LIMIT}), "profile mappings", deadline
+    )
+    if info["stopped_early"]:
+        # Without the full list the id order isn't known, so don't advance.
+        out["errors"].append(f"Profile mappings list incomplete ({info['stop_reason']}); no mappings checked.")
+        out["retry_same_cursor"] = True
+        return False
+
+    candidates = sorted(
+        (
+            m
+            for m in mappings
+            if m.get("id")
+            and {(m.get("source") or {}).get("type"), (m.get("target") or {}).get("type")} == {"user", "appuser"}
+            and _app_name_matches(needle, _mapping_app_name(m))
+        ),
+        key=lambda m: str(m["id"]),
+    )
+    ids = [str(m["id"]) for m in candidates]
+    start = bisect.bisect_right(ids, state["after"]) if state["after"] is not None else 0
+    pending = candidates[start:]
+    out["progress_total"] = len(candidates)
+
+    disk_path = _disk_cache_path(org_url) if org_url else None
+    if disk_path and pending:
+        _load_disk_cache(disk_path, time.time())
+
+    resolved, stats = await _fetch_mapping_details(client, pending, deadline)
+    out["mappings_fetched"] = stats["fetched"]
+    out["mappings_from_cache"] = stats["from_cache"]
+    out["rate_limited"] = stats["rate_limited"]
+    if disk_path and stats["fetched"]:
+        _save_disk_cache(disk_path, time.time())
+
+    # Only the contiguous resolved prefix counts, so the cursor never skips a mapping.
+    processed = 0
+    for i, summary in enumerate(pending):
+        if i not in resolved:
+            break
+        kind, payload = resolved[i]
+        mapping_id, app = str(summary["id"]), _mapping_app_name(summary)
+        if kind == "ok":
+            out["matches"].extend(_mapping_matches(summary, payload, pattern, wanted))
+        elif kind == "forbidden":
+            out["forbidden_mappings"].append({"mapping_id": mapping_id, "app": app})
+        elif kind == "failed":
+            reason = _error_result(payload)["error"] if not isinstance(payload, str) else payload
+            out["errors"].append(f"mapping {mapping_id} ({app}): {reason}")
+            state["failed"] += 1
+        state["after"] = mapping_id
+        processed += 1
+
+    state["checked"] = start + processed
+    return start + processed == len(candidates)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: SAML attribute statements
+# ---------------------------------------------------------------------------
+
+
+async def _saml_phase(
+    ctx: Context,
+    client,
+    state: Dict[str, Any],
+    needle: Optional[str],
+    pattern: re.Pattern,
+    deadline: float,
+    out: Dict[str, Any],
+) -> bool:
+    """Page /api/v1/apps with after=<last app id>, one whole page at a time. Returns True when done."""
+    first = True
+    while True:
+        if not first:
+            await asyncio.sleep(_PAGE_DELAY_SECONDS)
+        first = False
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return False
+        url = _mgmt_url("/apps", {"limit": _PAGE_LIMIT, "after": state["after"]})
+        try:
+            response, body, err = await asyncio.wait_for(okta_raw_request(client, "GET", url), timeout=left)
+        except asyncio.TimeoutError:
+            return False
+        if err:
+            if _is_rate_limited(err):
+                out["rate_limited"] = True
+            else:
+                out["errors"].append(f"applications page after {state['after']!r}: {_error_result(err)['error']}")
+                out["retry_same_cursor"] = True
+            return False
+
+        page = [a for a in (body if isinstance(body, list) else []) if isinstance(a, dict)]
+        for app in page:
+            if _app_name_matches(needle, app.get("label"), app.get("name")):
+                out["matches"].extend(_saml_matches(app, pattern))
+        state["checked"] += len(page)
+        if page and page[-1].get("id"):
+            state["after"] = str(page[-1]["id"])
+        try:
+            await ctx.info(f"Scanning applications for SAML attribute statements... {state['checked']} so far")
+        except Exception:
+            pass
+        if not page or not page[-1].get("id") or not _has_next_page(response, page):
+            return True
+
+
+# ---------------------------------------------------------------------------
+# One chunk of the scan
+# ---------------------------------------------------------------------------
 
 
 async def _scan(
@@ -394,103 +652,76 @@ async def _scan(
     include_saml: bool = True,
     app_name: Optional[str] = None,
     max_seconds: float = _DEFAULT_MAX_SECONDS,
+    cursor: Optional[str] = None,
+    org_url: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """Run one time-boxed chunk of the scan, starting at ``cursor``. Raises _CursorError for a bad cursor."""
     started = time.monotonic()
     deadline = started + max_seconds
-    pattern = _attribute_pattern(attributes)
-    wanted = set(attributes)
+    fingerprint = _args_fingerprint(attributes, include_saml, app_name)
+    state = _decode_cursor(cursor, fingerprint) if cursor else _new_cursor_state(fingerprint)
     needle = (app_name or "").strip().lower() or None
-    matches: List[Dict[str, Any]] = []
-    errors: List[str] = []
-    pagination: Dict[str, Any] = {}
-    _prune_detail_cache(started)
+    pattern = _attribute_pattern(attributes)
+    out: Dict[str, Any] = {
+        "matches": [],
+        "errors": [],
+        "forbidden_mappings": [],
+        "rate_limited": False,
+        "retry_same_cursor": False,
+        "progress_total": None,
+        "mappings_fetched": 0,
+        "mappings_from_cache": 0,
+    }
 
-    # 1 + 2. Profile mappings in both directions between Okta users and apps.
-    mappings, pagination["mappings"] = await _get_all(
-        ctx, client, _mgmt_url("/mappings", {"limit": _PAGE_LIMIT}), "profile mappings", deadline
+    if state["phase"] == _PHASE_MAPPINGS:
+        done = await _mappings_phase(ctx, client, state, needle, pattern, set(attributes), deadline, org_url, out)
+        if done:
+            state.update(phase=_PHASE_SAML if include_saml else _PHASE_DONE, after=None, checked=0)
+            out["progress_total"] = None
+    if state["phase"] == _PHASE_SAML and not out["rate_limited"] and time.monotonic() < deadline:
+        if await _saml_phase(ctx, client, state, needle, pattern, deadline, out):
+            state["phase"] = _PHASE_DONE
+
+    finished = state["phase"] == _PHASE_DONE
+    matches = sorted(
+        out["matches"], key=lambda r: (str(r.get("app") or "").lower(), r["via"], str(r.get("app_attribute") or ""))
     )
-    candidates = [
-        m
-        for m in mappings
-        if {(m.get("source") or {}).get("type"), (m.get("target") or {}).get("type")} == {"user", "appuser"}
-        and _app_name_matches(needle, _mapping_app_name(m))
-    ]
-
-    # 3. SAML attribute statements. The apps list is cached, so this hits Okta once per TTL.
-    apps: List[Dict[str, Any]] = []
-    saml_from_cache = False
-    if include_saml:
-        cached = _cached_apps(started)
-        if cached is not None:
-            apps, saml_from_cache = cached, True
-            pagination["apps"] = {"stopped_early": False, "from_cache": True, "total_items": len(apps)}
-        else:
-            try:
-                apps, pagination["apps"] = await _get_all(
-                    ctx, client, _mgmt_url("/apps", {"limit": _PAGE_LIMIT}), "applications", deadline
-                )
-                if not pagination["apps"]["stopped_early"]:
-                    _APPS_CACHE.update(fetched_at=time.monotonic(), apps=apps)
-            except _ApiError as e:
-                rate_limited = _is_rate_limited(e.err)
-                reason = "Okta rate limit hit (HTTP 429)" if rate_limited else _error_result(e.err)["error"]
-                errors.append(f"applications list: {reason}")
-                pagination["apps"] = {"stopped_early": True, "stop_reason": reason, "pages_fetched": 0}
-        for app in apps:
-            if _app_name_matches(needle, app.get("label"), app.get("name")):
-                matches.extend(_saml_matches(app, pattern))
-
-    # Mapping details: reuse the cache, fetch the rest within the time budget.
-    to_fetch = [m for m in candidates if _cached_detail(m.get("id"), started) is None]
-    from_cache = len(candidates) - len(to_fetch)
-    timed_out, rate_limited = False, False
-    if to_fetch:
-        try:
-            await ctx.info(f"Reading {len(to_fetch)} mapping details ({from_cache} cached)...")
-        except Exception:
-            pass
-        timed_out, rate_limited = await _fetch_details(client, to_fetch, deadline, errors)
-
-    now = time.monotonic()
-    checked = 0
-    for summary in candidates:
-        detail = _cached_detail(summary.get("id"), now)
-        if detail is not None:
-            checked += 1
-            matches.extend(_mapping_matches(summary, detail, pattern, wanted))
-    remaining = len(candidates) - checked
-    listing_cut_short = any(p.get("stopped_early") for p in pagination.values())
-
-    matches.sort(key=lambda r: (str(r.get("app") or "").lower(), r["via"], str(r.get("app_attribute") or "")))
-    by_attribute = {a: sorted({str(r["app"]) for r in matches if a in r["okta_attributes"]}) for a in attributes}
     result: Dict[str, Any] = {
         "attributes": attributes,
         "app_name": app_name,
-        "apps_by_attribute": by_attribute,
         "matches": matches,
+        "apps_by_attribute": {
+            a: sorted({str(r["app"]) for r in matches if a in r["okta_attributes"]}) for a in attributes
+        },
         "total_matches": len(matches),
-        "mappings_total": len(candidates),
-        "mappings_checked": checked,
-        "mappings_remaining": remaining,
-        "mappings_from_cache": from_cache,
-        "saml_apps_from_cache": saml_from_cache,
-        "errors": errors,
-        "pagination_info": pagination,
-        "elapsed_seconds": round(now - started, 1),
-        "complete": not errors and not remaining and not listing_cut_short,
+        "forbidden_mappings": out["forbidden_mappings"],
+        "errors": out["errors"],
+        "progress": {
+            "phase": state["phase"],
+            "checked_so_far": state["checked"],
+            "total": out["progress_total"] if state["phase"] == _PHASE_MAPPINGS else None,
+            "failed_so_far": state["failed"],
+        },
+        "next_cursor": None if finished else _encode_cursor(state),
+        "complete": finished and state["failed"] == 0,
+        "mappings_fetched": out["mappings_fetched"],
+        "mappings_from_cache": out["mappings_from_cache"],
+        "elapsed_seconds": round(time.monotonic() - started, 1),
     }
-    if timed_out or rate_limited or (listing_cut_short and not errors):
-        why = "Okta rate-limited the scan" if rate_limited else "the time budget ran out"
+    if out["rate_limited"]:
+        result["errors"].append("Okta rate limit hit (HTTP 429); stopped early.")
+    if not finished:
+        wait = " Wait about a minute first because Okta rate-limited this call." if out["rate_limited"] else ""
+        retry = " The failed step will be retried." if out["retry_same_cursor"] else ""
         result["message"] = (
-            f"Partial result: {why} with {remaining} of {len(candidates)} mappings not yet checked. "
-            "Progress is cached, so call find_profile_attribute_usage again with the same arguments "
-            "to continue; repeat until complete is true."
-            + (" Wait about a minute first because of the rate limit." if rate_limited else "")
+            f"Partial result ({state['phase']} phase). Call find_profile_attribute_usage again with the same "
+            "arguments and cursor=next_cursor, add this call's matches to the ones you already have, and "
+            f"repeat until next_cursor is null.{wait}{retry}"
         )
-    elif not result["complete"]:
+    elif state["failed"]:
         result["message"] = (
-            "Partial result: some requests failed (see errors). Calling again with the same arguments "
-            "retries only the failed parts."
+            f"Scan finished, but {state['failed']} mapping(s) could not be read (see errors in earlier "
+            "calls), so the result may be missing apps."
         )
     return result
 
@@ -509,6 +740,7 @@ async def find_profile_attribute_usage(
     include_saml: bool = True,
     app_name: Optional[str] = None,
     max_seconds: float = _DEFAULT_MAX_SECONDS,
+    cursor: Optional[str] = None,
 ) -> dict:
     """Find which apps use given Okta user profile attributes.
 
@@ -525,18 +757,23 @@ async def find_profile_attribute_usage(
     Not covered: OIDC custom claims on authorization servers, group rules,
     Okta Workflows, and expressions that reference the attribute indirectly.
 
-    RESUMABLE — CALL AGAIN UNTIL complete IS TRUE. Each call works for at most
-    ``max_seconds``, then returns what it has. Mapping details and the apps
-    list are cached for 30 minutes, so each repeat call continues where the
-    last one stopped. If the result has ``complete: false`` and
-    ``mappings_remaining > 0``, call this tool again with the SAME arguments
-    (follow ``message``) and keep going until ``complete`` is true before
-    answering. If you must answer earlier, say the result is partial. If
-    ``errors`` mentions a rate limit (HTTP 429), wait about a minute first.
+    PAGED — CALL AGAIN WITH next_cursor UNTIL IT IS NULL. Large orgs need
+    several calls. Each call works for at most ``max_seconds`` and returns
+    ONLY the matches found in that chunk, plus ``next_cursor``. While
+    ``next_cursor`` is not null, call this tool again with the SAME
+    attributes, include_saml and app_name and ``cursor=next_cursor``. Keep
+    every call's ``matches`` and ``forbidden_mappings`` and combine them; do
+    not answer until ``next_cursor`` is null, or say the result is partial.
+    If ``errors`` mentions a rate limit (HTTP 429), wait about a minute
+    before the next call. ``progress`` shows the phase (mappings, then saml,
+    then done) and how far it got.
 
-    Read-only. Makes one request per Okta<->app mapping (none for mappings
-    already cached). Pass ``app_name`` when the question is about specific
-    apps so only those are read.
+    ``forbidden_mappings`` lists mappings the service app may not read (HTTP
+    403, usually an admin role limited to some apps). They don't stop the
+    scan, but those apps weren't checked; mention them in the answer.
+
+    Read-only. Pass ``app_name`` when the question is about specific apps so
+    only those are read.
 
     Parameters:
         attributes (list[str], required): Okta user profile variable names,
@@ -549,19 +786,22 @@ async def find_profile_attribute_usage(
             label or name on SAML apps. Default: all apps.
         max_seconds (float, optional): Time budget for this call. Default 60,
             capped at 80.
+        cursor (str, optional): ``next_cursor`` from the previous call.
+            Omit to start a new scan.
 
     Returns:
         Dict containing:
-        - apps_by_attribute: {attribute: [app names]}
-        - matches: One row per app/attribute/expression with direction, via,
-          app_attribute, expression and push_status
-        - total_matches
-        - mappings_total, mappings_checked, mappings_remaining,
-          mappings_from_cache, saml_apps_from_cache
-        - complete: False if any part of the scan failed, was cut short, or
-          still has mappings remaining
-        - message: Present when the result is partial; says what to do next
-        - errors, pagination_info, elapsed_seconds
+        - matches: This chunk's rows (app, direction, via, app_attribute,
+          okta_attributes, expression, push_status)
+        - apps_by_attribute: {attribute: [app names]} for this chunk only
+        - forbidden_mappings: [{mapping_id, app}] this chunk could not read (403)
+        - next_cursor: Pass back as ``cursor``; null when the scan is finished
+        - progress: {phase, checked_so_far, total, failed_so_far}; total is
+          null in the saml phase (the app count isn't known in advance)
+        - complete: True only on the final chunk, when no mapping failed
+        - message: What to do next, when the scan isn't finished or had failures
+        - errors, total_matches, mappings_fetched, mappings_from_cache,
+          elapsed_seconds
     """
     attributes = [a.strip() for a in (attributes or []) if a and a.strip()]
     if not attributes:
@@ -576,19 +816,23 @@ async def find_profile_attribute_usage(
     budget = min(max(budget, 1.0), _MAX_SECONDS_CAP)
 
     logger.info(
-        f"Finding profile attribute usage for {attributes} "
-        f"(include_saml={include_saml}, app_name={app_name!r}, max_seconds={budget})"
+        f"Finding profile attribute usage for {attributes} (include_saml={include_saml}, "
+        f"app_name={app_name!r}, max_seconds={budget}, resumed={bool(cursor)})"
     )
     manager = ctx.request_context.lifespan_context.okta_auth_manager
 
     try:
         client = await get_okta_client(manager)
-        result = await _scan(ctx, client, attributes, include_saml, app_name, budget)
+        result = await _scan(
+            ctx, client, attributes, include_saml, app_name, budget, cursor, getattr(manager, "org_url", None)
+        )
         logger.info(
-            f"Profile attribute usage for {attributes}: {result['total_matches']} matches, "
-            f"{result['mappings_remaining']} mappings remaining, complete={result['complete']}"
+            f"Profile attribute usage chunk for {attributes}: {result['total_matches']} matches, "
+            f"progress={result['progress']}, complete={result['complete']}"
         )
         return result
+    except _CursorError as e:
+        return {"error": str(e)}
     except _ApiError as e:
         logger.error(f"Okta API error while finding profile attribute usage: {e.err}")
         return _error_result(e.err)
