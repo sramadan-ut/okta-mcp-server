@@ -24,9 +24,9 @@ Resumability: there is one ``GET /api/v1/mappings/{id}`` per Okta<->app
 mapping, which can outlast the MCP client's ~100s timeout in large orgs, and
 some MCP proxies start a fresh server process per tool call. So the tool is
 stateless: each call has a time budget and returns an opaque ``next_cursor``
-that records the phase (``mappings`` then ``saml``) and the last processed
-id. Mapping candidates are sorted by id so the order is the same in every
-process. Mapping details are also cached in memory and in a per-org JSON file
+that records the phase (``mappings``, then ``group_rules``, then ``saml``)
+and the last processed id. Mapping candidates are sorted by id so the
+order is the same in every process. Mapping details are also cached in memory and in a per-org JSON file
 under /tmp for 30 minutes, purely as a speedup: results never depend on the
 cache. An HTTP 429 stops the call instead of retrying in a loop.
 """
@@ -52,7 +52,7 @@ from mcp.server.fastmcp import Context
 from okta_mcp_server.server import mcp
 from okta_mcp_server.utils.client import get_okta_client
 from okta_mcp_server.utils.raw_request import okta_raw_request
-from okta_mcp_server.utils.scope_guard import MissingScopeError, require_scopes
+from okta_mcp_server.utils.scope_guard import MissingScopeError, get_configured_scopes, require_scopes
 from okta_mcp_server.utils.serialization import json_response
 
 _MGMT_BASE = "/api/v1"
@@ -71,10 +71,14 @@ _CACHE_TTL_SECONDS = 30 * 60
 #: Directory for the per-org mapping detail cache file.
 _DISK_CACHE_DIR = Path("/tmp")
 
-_CURSOR_VERSION = 1
+_CURSOR_VERSION = 2
 _PHASE_MAPPINGS = "mappings"
+_PHASE_GROUP_RULES = "group_rules"
 _PHASE_SAML = "saml"
 _PHASE_DONE = "done"
+
+#: Scope for the optional group rules phase. The tool itself doesn't require it.
+_GROUPS_READ_SCOPE = "okta.groups.read"
 
 _LINK_NEXT_RE = re.compile(r'<([^>]+)>\s*;\s*rel="?next"?')
 
@@ -163,8 +167,12 @@ class _CursorError(ValueError):
     pass
 
 
-def _args_fingerprint(attributes: List[str], include_saml: bool, app_name: Optional[str]) -> str:
-    raw = json.dumps([sorted(attributes), bool(include_saml), (app_name or "").strip().lower()])
+def _args_fingerprint(
+    attributes: List[str], include_saml: bool, app_name: Optional[str], include_group_rules: bool = True
+) -> str:
+    raw = json.dumps(
+        [sorted(attributes), bool(include_saml), (app_name or "").strip().lower(), bool(include_group_rules)]
+    )
     return hashlib.sha256(raw.encode()).hexdigest()[:12]
 
 
@@ -176,6 +184,8 @@ def _new_cursor_state(fingerprint: str) -> Dict[str, Any]:
         "after": None,
         "checked": 0,
         "failed": 0,
+        # True once the group rules phase was skipped (missing scope / 403), so the final chunk isn't "complete".
+        "group_rules_skipped": False,
     }
 
 
@@ -193,16 +203,18 @@ def _decode_cursor(cursor: str, fingerprint: str) -> Dict[str, Any]:
     if (
         not isinstance(state, dict)
         or state.get("v") != _CURSOR_VERSION
-        or state.get("phase") not in (_PHASE_MAPPINGS, _PHASE_SAML)
+        or state.get("phase") not in (_PHASE_MAPPINGS, _PHASE_GROUP_RULES, _PHASE_SAML)
         or not isinstance(state.get("after"), (str, type(None)))
         or not isinstance(state.get("checked"), int)
         or not isinstance(state.get("failed"), int)
+        or not isinstance(state.get("group_rules_skipped"), bool)
     ):
         raise _CursorError("Invalid cursor: pass next_cursor exactly as returned by the previous call.")
     if state.get("args") != fingerprint:
         raise _CursorError(
             "This cursor belongs to a scan with different arguments. Pass the same attributes, "
-            "include_saml and app_name as the call that returned it, or omit cursor to start over."
+            "include_saml, include_group_rules and app_name as the call that returned it, or omit "
+            "cursor to start over."
         )
     return state
 
@@ -444,6 +456,27 @@ def _saml_matches(app: Dict[str, Any], pattern: re.Pattern) -> List[Dict[str, An
     return rows
 
 
+def _group_rule_matches(rule: Dict[str, Any], pattern: re.Pattern) -> List[Dict[str, Any]]:
+    """One row if the rule's expression reads a wanted attribute, else none."""
+    expr = ((rule.get("conditions") or {}).get("expression") or {}).get("value")
+    if not isinstance(expr, str) or not pattern.search(expr):
+        return []
+    group_ids = ((rule.get("actions") or {}).get("assignUserToGroups") or {}).get("groupIds") or []
+    names = (rule.get("_embedded") or {}).get("groupIdToGroupName") or {}
+    return [
+        {
+            "rule": rule.get("name"),
+            "rule_id": rule.get("id"),
+            "rule_status": rule.get("status"),
+            "direction": "okta_to_group",
+            "via": "group_rule",
+            "okta_attributes": sorted(set(pattern.findall(expr))),
+            "expression": expr,
+            "assigns_to_groups": [names.get(gid) or gid for gid in group_ids],
+        }
+    ]
+
+
 def _mapping_app_name(summary: Dict[str, Any]) -> str:
     """Name of the app side of a user<->appuser mapping."""
     for side in ("source", "target"):
@@ -590,8 +623,97 @@ async def _mappings_phase(
 
 
 # ---------------------------------------------------------------------------
-# Phase 2: SAML attribute statements
+# Phases 2 and 3: group rules and SAML attribute statements (whole-page paging)
 # ---------------------------------------------------------------------------
+
+
+async def _page_phase(
+    ctx: Context,
+    client,
+    state: Dict[str, Any],
+    path: str,
+    params: Dict[str, Any],
+    what: str,
+    deadline: float,
+    out: Dict[str, Any],
+    handle_page,
+) -> Tuple[bool, Any]:
+    """Page ``path`` with after=<last item id>, one whole page at a time.
+
+    ``handle_page(page)`` is called once per page, after which ``state["after"]``
+    moves to the page's last id, so a page is never processed twice across
+    calls. Returns ``(done, error)``: ``error`` is a non-429 API error that
+    stopped the phase (the caller decides what to do with it). A 429 sets
+    ``out["rate_limited"]`` and returns ``(False, None)``.
+    """
+    first = True
+    while True:
+        if not first:
+            await asyncio.sleep(_PAGE_DELAY_SECONDS)
+        first = False
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return False, None
+        url = _mgmt_url(path, {**params, "limit": _PAGE_LIMIT, "after": state["after"]})
+        try:
+            response, body, err = await asyncio.wait_for(okta_raw_request(client, "GET", url), timeout=left)
+        except asyncio.TimeoutError:
+            return False, None
+        if err:
+            if _is_rate_limited(err):
+                out["rate_limited"] = True
+                return False, None
+            return False, err
+
+        page = [a for a in (body if isinstance(body, list) else []) if isinstance(a, dict)]
+        handle_page(page)
+        state["checked"] += len(page)
+        if page and page[-1].get("id"):
+            state["after"] = str(page[-1]["id"])
+        try:
+            await ctx.info(f"Scanning {what}... {state['checked']} so far")
+        except Exception:
+            pass
+        if not page or not page[-1].get("id") or not _has_next_page(response, page):
+            return True, None
+
+
+async def _group_rules_phase(
+    ctx: Context,
+    client,
+    state: Dict[str, Any],
+    pattern: re.Pattern,
+    deadline: float,
+    out: Dict[str, Any],
+) -> bool:
+    """Scan group rule expressions. Returns True when the phase is over (done or skipped).
+
+    A 401/403 skips the phase (recorded in ``errors`` and the cursor) instead
+    of failing the scan. ``app_name`` doesn't apply to group rules.
+    """
+
+    def handle(page: List[Dict[str, Any]]) -> None:
+        for rule in page:
+            out["matches"].extend(_group_rule_matches(rule, pattern))
+
+    done, err = await _page_phase(
+        ctx, client, state, "/groups/rules", {"expand": "groupIdToGroupName"}, "group rules", deadline, out, handle
+    )
+    if err is None:
+        return done
+    status = getattr(err, "status", None)
+    if status in (401, 403):
+        detail = getattr(err, "error_summary", None)
+        out["errors"].append(
+            f"Group rules not checked: Okta denied GET /api/v1/groups/rules (HTTP {status}"
+            + (f": {detail}" if detail else "")
+            + f"). Grant {_GROUPS_READ_SCOPE} and an admin role that can read groups to include them."
+        )
+        state["group_rules_skipped"] = True
+        return True
+    out["errors"].append(f"group rules page after {state['after']!r}: {_error_result(err)['error']}")
+    out["retry_same_cursor"] = True
+    return False
 
 
 async def _saml_phase(
@@ -603,41 +725,20 @@ async def _saml_phase(
     deadline: float,
     out: Dict[str, Any],
 ) -> bool:
-    """Page /api/v1/apps with after=<last app id>, one whole page at a time. Returns True when done."""
-    first = True
-    while True:
-        if not first:
-            await asyncio.sleep(_PAGE_DELAY_SECONDS)
-        first = False
-        left = deadline - time.monotonic()
-        if left <= 0:
-            return False
-        url = _mgmt_url("/apps", {"limit": _PAGE_LIMIT, "after": state["after"]})
-        try:
-            response, body, err = await asyncio.wait_for(okta_raw_request(client, "GET", url), timeout=left)
-        except asyncio.TimeoutError:
-            return False
-        if err:
-            if _is_rate_limited(err):
-                out["rate_limited"] = True
-            else:
-                out["errors"].append(f"applications page after {state['after']!r}: {_error_result(err)['error']}")
-                out["retry_same_cursor"] = True
-            return False
+    """Scan SAML attribute statements on /api/v1/apps. Returns True when done."""
 
-        page = [a for a in (body if isinstance(body, list) else []) if isinstance(a, dict)]
+    def handle(page: List[Dict[str, Any]]) -> None:
         for app in page:
             if _app_name_matches(needle, app.get("label"), app.get("name")):
                 out["matches"].extend(_saml_matches(app, pattern))
-        state["checked"] += len(page)
-        if page and page[-1].get("id"):
-            state["after"] = str(page[-1]["id"])
-        try:
-            await ctx.info(f"Scanning applications for SAML attribute statements... {state['checked']} so far")
-        except Exception:
-            pass
-        if not page or not page[-1].get("id") or not _has_next_page(response, page):
-            return True
+
+    done, err = await _page_phase(
+        ctx, client, state, "/apps", {}, "applications for SAML attribute statements", deadline, out, handle
+    )
+    if err is not None:
+        out["errors"].append(f"applications page after {state['after']!r}: {_error_result(err)['error']}")
+        out["retry_same_cursor"] = True
+    return done
 
 
 # ---------------------------------------------------------------------------
@@ -654,11 +755,17 @@ async def _scan(
     max_seconds: float = _DEFAULT_MAX_SECONDS,
     cursor: Optional[str] = None,
     org_url: Optional[str] = None,
+    include_group_rules: bool = True,
+    groups_scope_granted: bool = True,
 ) -> Dict[str, Any]:
-    """Run one time-boxed chunk of the scan, starting at ``cursor``. Raises _CursorError for a bad cursor."""
+    """Run one time-boxed chunk of the scan, starting at ``cursor``. Raises _CursorError for a bad cursor.
+
+    ``groups_scope_granted`` is False when OKTA_SCOPES lacks okta.groups.read;
+    the group rules phase is then skipped without a request.
+    """
     started = time.monotonic()
     deadline = started + max_seconds
-    fingerprint = _args_fingerprint(attributes, include_saml, app_name)
+    fingerprint = _args_fingerprint(attributes, include_saml, app_name, include_group_rules)
     state = _decode_cursor(cursor, fingerprint) if cursor else _new_cursor_state(fingerprint)
     needle = (app_name or "").strip().lower() or None
     pattern = _attribute_pattern(attributes)
@@ -673,25 +780,50 @@ async def _scan(
         "mappings_from_cache": 0,
     }
 
+    phase_after_group_rules = _PHASE_SAML if include_saml else _PHASE_DONE
+
+    def can_continue() -> bool:
+        return not out["rate_limited"] and not out["retry_same_cursor"] and time.monotonic() < deadline
+
     if state["phase"] == _PHASE_MAPPINGS:
         done = await _mappings_phase(ctx, client, state, needle, pattern, set(attributes), deadline, org_url, out)
         if done:
-            state.update(phase=_PHASE_SAML if include_saml else _PHASE_DONE, after=None, checked=0)
+            next_phase = _PHASE_GROUP_RULES if include_group_rules else phase_after_group_rules
+            state.update(phase=next_phase, after=None, checked=0)
             out["progress_total"] = None
-    if state["phase"] == _PHASE_SAML and not out["rate_limited"] and time.monotonic() < deadline:
+    if state["phase"] == _PHASE_GROUP_RULES and not groups_scope_granted:
+        out["errors"].append(
+            f"Group rules not checked: {_GROUPS_READ_SCOPE} is not in OKTA_SCOPES. Add it (and grant it to "
+            "the service app) to include group rules, or pass include_group_rules=False."
+        )
+        state.update(phase=phase_after_group_rules, after=None, checked=0, group_rules_skipped=True)
+    if state["phase"] == _PHASE_GROUP_RULES and can_continue():
+        if await _group_rules_phase(ctx, client, state, pattern, deadline, out):
+            state.update(phase=phase_after_group_rules, after=None, checked=0)
+    if state["phase"] == _PHASE_SAML and can_continue():
         if await _saml_phase(ctx, client, state, needle, pattern, deadline, out):
             state["phase"] = _PHASE_DONE
 
     finished = state["phase"] == _PHASE_DONE
     matches = sorted(
-        out["matches"], key=lambda r: (str(r.get("app") or "").lower(), r["via"], str(r.get("app_attribute") or ""))
+        out["matches"],
+        key=lambda r: (
+            str(r.get("app") or r.get("rule") or "").lower(),
+            r["via"],
+            str(r.get("app_attribute") or r.get("rule_id") or ""),
+        ),
     )
+    app_matches = [r for r in matches if r["via"] != "group_rule"]
+    rule_matches = [r for r in matches if r["via"] == "group_rule"]
     result: Dict[str, Any] = {
         "attributes": attributes,
         "app_name": app_name,
         "matches": matches,
         "apps_by_attribute": {
-            a: sorted({str(r["app"]) for r in matches if a in r["okta_attributes"]}) for a in attributes
+            a: sorted({str(r["app"]) for r in app_matches if a in r["okta_attributes"]}) for a in attributes
+        },
+        "group_rules_by_attribute": {
+            a: sorted({str(r["rule"]) for r in rule_matches if a in r["okta_attributes"]}) for a in attributes
         },
         "total_matches": len(matches),
         "forbidden_mappings": out["forbidden_mappings"],
@@ -703,7 +835,7 @@ async def _scan(
             "failed_so_far": state["failed"],
         },
         "next_cursor": None if finished else _encode_cursor(state),
-        "complete": finished and state["failed"] == 0,
+        "complete": finished and state["failed"] == 0 and not state["group_rules_skipped"],
         "mappings_fetched": out["mappings_fetched"],
         "mappings_from_cache": out["mappings_from_cache"],
         "elapsed_seconds": round(time.monotonic() - started, 1),
@@ -718,11 +850,17 @@ async def _scan(
             "arguments and cursor=next_cursor, add this call's matches to the ones you already have, and "
             f"repeat until next_cursor is null.{wait}{retry}"
         )
-    elif state["failed"]:
-        result["message"] = (
-            f"Scan finished, but {state['failed']} mapping(s) could not be read (see errors in earlier "
-            "calls), so the result may be missing apps."
-        )
+    else:
+        gaps = []
+        if state["failed"]:
+            gaps.append(
+                f"{state['failed']} mapping(s) could not be read (see errors in earlier calls), so the "
+                "result may be missing apps"
+            )
+        if state["group_rules_skipped"]:
+            gaps.append(f"group rules were not checked (needs {_GROUPS_READ_SCOPE})")
+        if gaps:
+            result["message"] = "Scan finished, but " + "; ".join(gaps) + "."
     return result
 
 
@@ -738,11 +876,12 @@ async def find_profile_attribute_usage(
     ctx: Context,
     attributes: List[str],
     include_saml: bool = True,
+    include_group_rules: bool = True,
     app_name: Optional[str] = None,
     max_seconds: float = _DEFAULT_MAX_SECONDS,
     cursor: Optional[str] = None,
 ) -> dict:
-    """Find which apps use given Okta user profile attributes.
+    """Find which apps and group rules use given Okta user profile attributes.
 
     Use this for questions like "which apps use the Team field?", "what breaks
     if I rename or delete attribute X?", or "which app populates X?". Checks:
@@ -751,22 +890,28 @@ async def find_profile_attribute_usage(
        (provisioning / profile push). ``direction == "okta_to_app"``.
     2. App -> Okta profile mappings that write the attribute (e.g. an HRIS
        import). ``direction == "app_to_okta"``.
-    3. SAML attribute statements whose expressions read the attribute
+    3. Group rules whose expressions read the attribute (``via ==
+       "group_rule"``, ``direction == "okta_to_group"``), active and
+       inactive, with the groups each rule assigns. Needs okta.groups.read;
+       without it (or on HTTP 403) group rules are skipped, noted in
+       ``errors``, and the scan continues.
+    4. SAML attribute statements whose expressions read the attribute
        (``via == "saml_attribute_statement"``), including inactive apps.
 
-    Not covered: OIDC custom claims on authorization servers, group rules,
-    Okta Workflows, and expressions that reference the attribute indirectly.
+    Not covered: OIDC custom claims on authorization servers, Okta
+    Workflows, and expressions that reference the attribute indirectly.
 
     PAGED — CALL AGAIN WITH next_cursor UNTIL IT IS NULL. Large orgs need
     several calls. Each call works for at most ``max_seconds`` and returns
     ONLY the matches found in that chunk, plus ``next_cursor``. While
     ``next_cursor`` is not null, call this tool again with the SAME
-    attributes, include_saml and app_name and ``cursor=next_cursor``. Keep
-    every call's ``matches`` and ``forbidden_mappings`` and combine them; do
-    not answer until ``next_cursor`` is null, or say the result is partial.
+    attributes, include_saml, include_group_rules and app_name and
+    ``cursor=next_cursor``. Keep every call's ``matches`` and
+    ``forbidden_mappings`` and combine them; do not answer until
+    ``next_cursor`` is null, or say the result is partial.
     If ``errors`` mentions a rate limit (HTTP 429), wait about a minute
-    before the next call. ``progress`` shows the phase (mappings, then saml,
-    then done) and how far it got.
+    before the next call. ``progress`` shows the phase (mappings, then
+    group_rules, then saml, then done) and how far it got.
 
     ``forbidden_mappings`` lists mappings the service app may not read (HTTP
     403, usually an admin role limited to some apps). They don't stop the
@@ -781,9 +926,12 @@ async def find_profile_attribute_usage(
             with get_user_profile_attributes if unsure.
         include_saml (bool, optional): Also scan SAML attribute statements.
             Default: True.
+        include_group_rules (bool, optional): Also scan group rule
+            expressions. Default: True.
         app_name (str, optional): Only check apps whose name contains this
             text (case-insensitive): the app name on profile mappings, and the
-            label or name on SAML apps. Default: all apps.
+            label or name on SAML apps. Does not filter group rules, which
+            aren't tied to an app. Default: all apps.
         max_seconds (float, optional): Time budget for this call. Default 60,
             capped at 80.
         cursor (str, optional): ``next_cursor`` from the previous call.
@@ -791,14 +939,18 @@ async def find_profile_attribute_usage(
 
     Returns:
         Dict containing:
-        - matches: This chunk's rows (app, direction, via, app_attribute,
-          okta_attributes, expression, push_status)
+        - matches: This chunk's rows. App rows: app, direction, via,
+          app_attribute, okta_attributes, expression, push_status. Group rule
+          rows (via == "group_rule"): rule, rule_id, rule_status, direction,
+          okta_attributes, expression, assigns_to_groups (group names)
         - apps_by_attribute: {attribute: [app names]} for this chunk only
+        - group_rules_by_attribute: {attribute: [rule names]} for this chunk only
         - forbidden_mappings: [{mapping_id, app}] this chunk could not read (403)
         - next_cursor: Pass back as ``cursor``; null when the scan is finished
         - progress: {phase, checked_so_far, total, failed_so_far}; total is
-          null in the saml phase (the app count isn't known in advance)
-        - complete: True only on the final chunk, when no mapping failed
+          null in the group_rules and saml phases (counts aren't known in advance)
+        - complete: True only on the final chunk, when no mapping failed and
+          group rules weren't skipped
         - message: What to do next, when the scan isn't finished or had failures
         - errors, total_matches, mappings_fetched, mappings_from_cache,
           elapsed_seconds
@@ -817,14 +969,25 @@ async def find_profile_attribute_usage(
 
     logger.info(
         f"Finding profile attribute usage for {attributes} (include_saml={include_saml}, "
-        f"app_name={app_name!r}, max_seconds={budget}, resumed={bool(cursor)})"
+        f"include_group_rules={include_group_rules}, app_name={app_name!r}, max_seconds={budget}, "
+        f"resumed={bool(cursor)})"
     )
     manager = ctx.request_context.lifespan_context.okta_auth_manager
+    configured = get_configured_scopes(manager)
 
     try:
         client = await get_okta_client(manager)
         result = await _scan(
-            ctx, client, attributes, include_saml, app_name, budget, cursor, getattr(manager, "org_url", None)
+            ctx,
+            client,
+            attributes,
+            include_saml,
+            app_name,
+            budget,
+            cursor,
+            getattr(manager, "org_url", None),
+            include_group_rules=include_group_rules,
+            groups_scope_granted=configured is None or _GROUPS_READ_SCOPE in configured,
         )
         logger.info(
             f"Profile attribute usage chunk for {attributes}: {result['total_matches']} matches, "

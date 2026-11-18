@@ -75,6 +75,23 @@ APPS = [
     },
     {"id": "0oaE", "label": "Zapier", "name": "zapier", "settings": {"app": {}}},
 ]
+GROUP_RULES = [
+    {
+        "id": "0prT",
+        "name": "Team Platform",
+        "status": "ACTIVE",
+        "conditions": {"expression": {"value": 'user.Team == "Platform" OR user.Team == "Infra"'}},
+        "actions": {"assignUserToGroups": {"groupIds": ["00gP", "00gUnknown"]}},
+        "_embedded": {"groupIdToGroupName": {"00gP": "Platform"}},
+    },
+    {
+        "id": "0prL",
+        "name": "Leads",
+        "status": "INACTIVE",
+        "conditions": {"expression": {"value": "user.TeamLead == true"}},  # must NOT match Team
+        "actions": {"assignUserToGroups": {"groupIds": ["00gL"]}},
+    },
+]
 
 
 def fake_request():
@@ -86,6 +103,8 @@ def fake_request():
             return resp, MAPPINGS, None
         if url.startswith("/api/v1/apps"):
             return resp, APPS, None
+        if url.startswith("/api/v1/groups/rules"):
+            return resp, GROUP_RULES, None
         raise AssertionError(url)
 
     return AsyncMock(side_effect=_req)
@@ -99,11 +118,27 @@ async def test_scan_finds_reads_writes_and_saml(monkeypatch):
 
     assert result["complete"] is True
     assert result["apps_by_attribute"] == {"Team": ["BambooHR", "Slack"], "timeType": ["BambooHR", "Expel.io"]}
-    vias = {(r["app"], r["direction"], r["via"]) for r in result["matches"]}
+    vias = {(r.get("app"), r["direction"], r["via"]) for r in result["matches"]}
     assert ("Slack", "okta_to_app", "profile_mapping") in vias
     assert ("BambooHR", "app_to_okta", "profile_mapping") in vias
     assert ("Expel.io", "okta_to_app", "saml_attribute_statement") in vias
-    assert not any(r["app"] == "Zoom" for r in result["matches"])
+    assert not any(r.get("app") == "Zoom" for r in result["matches"])
+
+    # The Team rule is reported once; the TeamLead rule isn't reported at all.
+    rules = [r for r in result["matches"] if r["via"] == "group_rule"]
+    assert rules == [
+        {
+            "rule": "Team Platform",
+            "rule_id": "0prT",
+            "rule_status": "ACTIVE",
+            "direction": "okta_to_group",
+            "via": "group_rule",
+            "okta_attributes": ["Team"],
+            "expression": 'user.Team == "Platform" OR user.Team == "Infra"',
+            "assigns_to_groups": ["Platform", "00gUnknown"],
+        }
+    ]
+    assert result["group_rules_by_attribute"] == {"Team": ["Team Platform"], "timeType": []}
 
 
 def test_pattern_is_exact_and_case_sensitive():
@@ -195,11 +230,29 @@ MANY_APPS = [
 ]
 ALL_MAPPING_IDS = {m["id"] for m in MANY_MAPPINGS}
 SAML_TEAM_APPS = {"saml0", "saml2", "saml4", "saml6"}
+MANY_RULES = [
+    {
+        "id": f"0pr{i:02d}",
+        "name": f"rule{i}",
+        "status": "ACTIVE",
+        "conditions": {"expression": {"value": "user.Team == \"x\"" if i % 3 == 0 else "user.TeamLead == true"}},
+        "actions": {"assignUserToGroups": {"groupIds": [f"00g{i}"]}},
+        "_embedded": {"groupIdToGroupName": {f"00g{i}": f"group{i}"}},
+    }
+    for i in range(8)
+]
+RULE_TEAM_NAMES = {"rule0", "rule3", "rule6"}
 
 
-def paged_request(calls, detail_delay=0.0, page_delay=0.0, detail_errors=None):
+def _page_after(url, items):
+    after = parse_qs(urlparse(url).query).get("after", [None])[0]
+    start = 0 if after is None else [a["id"] for a in items].index(after) + 1
+    return items[start : start + pm._PAGE_LIMIT]
+
+
+def paged_request(calls, detail_delay=0.0, page_delay=0.0, detail_errors=None, rules_error=None):
     """Fake okta_raw_request: 40 mappings (listed out of order) that all read user.Team, and
-    MANY_APPS paged with after=<id> and no headers, so paging falls back to page size."""
+    MANY_RULES / MANY_APPS paged with after=<id> and no headers, so paging falls back to page size."""
 
     async def _req(client, method, url):
         calls.append(url)
@@ -214,11 +267,15 @@ def paged_request(calls, detail_delay=0.0, page_delay=0.0, detail_errors=None):
             return SimpleNamespace(headers={}), {"properties": {"team": {"expression": "user.Team"}}}, None
         if url.startswith("/api/v1/mappings"):
             return SimpleNamespace(headers={}), list(reversed(MANY_MAPPINGS)), None
+        if url.startswith("/api/v1/groups/rules"):
+            await asyncio.sleep(page_delay)
+            assert "expand=groupIdToGroupName" in url
+            if rules_error is not None:
+                return None, None, rules_error
+            return None, _page_after(url, MANY_RULES), None
         if url.startswith("/api/v1/apps"):
             await asyncio.sleep(page_delay)
-            after = parse_qs(urlparse(url).query).get("after", [None])[0]
-            start = 0 if after is None else [a["id"] for a in MANY_APPS].index(after) + 1
-            return None, MANY_APPS[start : start + pm._PAGE_LIMIT], None
+            return None, _page_after(url, MANY_APPS), None
         raise AssertionError(url)
 
     return _req
@@ -251,6 +308,10 @@ def _saml_apps(results):
     return [r["app"] for res in results for r in res["matches"] if r["via"] == "saml_attribute_statement"]
 
 
+def _rule_names(results):
+    return [r["rule"] for res in results for r in res["matches"] if r["via"] == "group_rule"]
+
+
 @pytest.mark.asyncio
 async def test_cursor_resumes_in_fresh_state_through_all_phases(monkeypatch):
     calls = []
@@ -259,10 +320,10 @@ async def test_cursor_resumes_in_fresh_state_through_all_phases(monkeypatch):
 
     results = await run_to_completion(["Team"], max_seconds=0.05)
 
-    order = {"mappings": 0, "saml": 1, "done": 2}
+    order = {"mappings": 0, "group_rules": 1, "saml": 2, "done": 3}
     phases = [r["progress"]["phase"] for r in results]
     assert phases == sorted(phases, key=order.get)
-    assert phases[0] == "mappings" and "saml" in phases and phases[-1] == "done"
+    assert phases[0] == "mappings" and "group_rules" in phases and "saml" in phases and phases[-1] == "done"
     assert len(results) >= 4
     # Every chunk but the last points to the next one.
     assert all(r["next_cursor"] and r["complete"] is False and "message" in r for r in results[:-1])
@@ -275,6 +336,9 @@ async def test_cursor_resumes_in_fresh_state_through_all_phases(monkeypatch):
     saml_apps = _saml_apps(results)
     assert len(saml_apps) == len(set(saml_apps))
     assert set(saml_apps) == SAML_TEAM_APPS
+    rule_names = _rule_names(results)
+    assert len(rule_names) == len(set(rule_names))
+    assert set(rule_names) == RULE_TEAM_NAMES
 
     # Nothing came from a cache, so correctness doesn't depend on it.
     assert all(r["mappings_from_cache"] == 0 for r in results)
@@ -287,6 +351,11 @@ async def test_cursor_resumes_in_fresh_state_through_all_phases(monkeypatch):
     afters = [parse_qs(urlparse(c).query).get("after", [""])[0] for c in calls if c.startswith("/api/v1/apps")]
     assert afters == sorted(afters)
     assert len(set(afters)) == 3  # 7 apps / 3 per page
+    rule_afters = [
+        parse_qs(urlparse(c).query).get("after", [""])[0] for c in calls if c.startswith("/api/v1/groups/rules")
+    ]
+    assert rule_afters == sorted(rule_afters)
+    assert len(set(rule_afters)) == 3  # 8 rules / 3 per page
 
 
 @pytest.mark.asyncio
@@ -297,6 +366,122 @@ async def test_include_saml_false_goes_straight_to_done(monkeypatch):
     assert [r["progress"]["phase"] for r in results] == ["done"]
     assert results[0]["complete"] is True
     assert not any(c.startswith("/api/v1/apps") for c in calls)
+    assert set(_rule_names(results)) == RULE_TEAM_NAMES
+
+
+@pytest.mark.asyncio
+async def test_include_group_rules_false_skips_the_phase(monkeypatch):
+    calls = []
+    monkeypatch.setattr(pm, "okta_raw_request", paged_request(calls))
+    results = await run_to_completion(["Team"], max_seconds=10, include_group_rules=False)
+    assert results[-1]["complete"] is True
+    assert not any(c.startswith("/api/v1/groups/rules") for c in calls)
+    assert _rule_names(results) == []
+    assert set(_saml_apps(results)) == SAML_TEAM_APPS
+
+    # Only group rules, no SAML: mappings -> group_rules -> done.
+    calls.clear()
+    results = await run_to_completion(["Team"], max_seconds=10, include_saml=False, include_group_rules=False)
+    assert results[-1]["complete"] is True
+    assert not any(c.startswith(("/api/v1/groups/rules", "/api/v1/apps")) for c in calls)
+
+
+@pytest.mark.asyncio
+async def test_phase_transitions_mappings_group_rules_saml_done(monkeypatch):
+    """Each phase that isn't finished keeps the cursor on it; a finished one hands off to the next."""
+    ran = []
+    finished = {"mappings": True, "group_rules": False, "saml": False}
+
+    def fake_phase(name):
+        def _phase(*args, **kwargs):
+            ran.append(name)
+            return finished[name]
+
+        return AsyncMock(side_effect=_phase)
+
+    monkeypatch.setattr(pm, "_mappings_phase", fake_phase("mappings"))
+    monkeypatch.setattr(pm, "_group_rules_phase", fake_phase("group_rules"))
+    monkeypatch.setattr(pm, "_saml_phase", fake_phase("saml"))
+    ctx = SimpleNamespace(info=AsyncMock())
+
+    first = await pm._scan(ctx, object(), ["Team"], max_seconds=10)
+    assert ran == ["mappings", "group_rules"] and first["progress"]["phase"] == "group_rules"
+
+    ran.clear()
+    finished["group_rules"] = True
+    second = await pm._scan(ctx, object(), ["Team"], max_seconds=10, cursor=first["next_cursor"])
+    assert ran == ["group_rules", "saml"] and second["progress"]["phase"] == "saml"
+
+    ran.clear()
+    finished["saml"] = True
+    third = await pm._scan(ctx, object(), ["Team"], max_seconds=10, cursor=second["next_cursor"])
+    assert ran == ["saml"] and third["progress"]["phase"] == "done"
+    assert third["next_cursor"] is None and third["complete"] is True
+
+
+@pytest.mark.asyncio
+async def test_missing_groups_scope_skips_group_rules_without_a_request(monkeypatch):
+    calls = []
+    monkeypatch.setattr(pm, "okta_raw_request", paged_request(calls))
+    results = await run_to_completion(["Team"], max_seconds=10, groups_scope_granted=False)
+    final = results[-1]
+    assert final["next_cursor"] is None
+    assert not any(c.startswith("/api/v1/groups/rules") for c in calls)
+    assert any("okta.groups.read is not in OKTA_SCOPES" in e for e in results[0]["errors"])
+    assert set(_saml_apps(results)) == SAML_TEAM_APPS  # moved on to SAML
+    assert final["complete"] is False
+    assert "group rules were not checked" in final["message"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        SimpleNamespace(status=403, error_code="E0000006", error_summary="You do not have permission"),
+        MissingScopeError(["okta.profileMappings.read", "okta.apps.read"], status=403, error_code="E0000006"),
+    ],
+)
+async def test_group_rules_403_is_recorded_and_scan_moves_on(monkeypatch, error):
+    calls = []
+    monkeypatch.setattr(pm, "okta_raw_request", paged_request(calls, rules_error=error))
+    results = await run_to_completion(["Team"], max_seconds=10)
+    final = results[-1]
+    assert final["next_cursor"] is None
+    assert len([c for c in calls if c.startswith("/api/v1/groups/rules")]) == 1  # not retried
+    errors = [e for r in results for e in r["errors"]]
+    assert len(errors) == 1 and "Group rules not checked" in errors[0] and "HTTP 403" in errors[0]
+    assert set(_saml_apps(results)) == SAML_TEAM_APPS
+    assert set(_mapping_ids(results)) == ALL_MAPPING_IDS
+    assert final["complete"] is False
+
+
+@pytest.mark.asyncio
+async def test_group_rules_other_errors_retry_the_same_page(monkeypatch):
+    calls = []
+    hits = {"n": 0}
+
+    def flaky():
+        hits["n"] += 1
+        return Exception("boom") if hits["n"] == 1 else None
+
+    base = paged_request(calls)
+
+    async def _req(client, method, url):
+        if url.startswith("/api/v1/groups/rules") and flaky() is not None:
+            calls.append(url)
+            return None, None, Exception("boom")
+        return await base(client, method, url)
+
+    monkeypatch.setattr(pm, "okta_raw_request", _req)
+    ctx = SimpleNamespace(info=AsyncMock())
+    first = await pm._scan(ctx, object(), ["Team"], max_seconds=10)
+    assert first["progress"]["phase"] == "group_rules"
+    assert any("group rules page" in e and "boom" in e for e in first["errors"])
+    assert not any(c.startswith("/api/v1/apps") for c in calls)
+
+    resumed = await pm._scan(ctx, object(), ["Team"], max_seconds=10, cursor=first["next_cursor"])
+    assert resumed["complete"] is True
+    assert set(_rule_names([first, resumed])) == RULE_TEAM_NAMES
 
 
 @pytest.mark.asyncio
@@ -382,6 +567,8 @@ async def test_cursor_must_match_arguments_and_be_well_formed(monkeypatch):
         await pm._scan(ctx, object(), ["timeType"], cursor=first["next_cursor"])
     with pytest.raises(pm._CursorError, match="different arguments"):
         await pm._scan(ctx, object(), ["Team"], app_name="slack", cursor=first["next_cursor"])
+    with pytest.raises(pm._CursorError, match="different arguments"):
+        await pm._scan(ctx, object(), ["Team"], include_group_rules=False, cursor=first["next_cursor"])
     with pytest.raises(pm._CursorError, match="Invalid cursor"):
         await pm._scan(ctx, object(), ["Team"], cursor="not-a-cursor!!")
     with pytest.raises(pm._CursorError, match="Invalid cursor"):
@@ -397,14 +584,16 @@ async def test_app_name_filters_mappings_and_saml_before_fetching(monkeypatch):
     slack = await pm._scan(ctx, object(), ["Team", "timeType"], app_name="SLA")
     urls = [c.args[2] for c in request.call_args_list]
     assert [u for u in urls if u.startswith("/api/v1/mappings/")] == ["/api/v1/mappings/prm1"]
-    assert {r["app"] for r in slack["matches"]} == {"Slack"}
+    assert {r["app"] for r in slack["matches"] if r["via"] != "group_rule"} == {"Slack"}
+    # app_name doesn't filter group rules.
+    assert [r["rule"] for r in slack["matches"] if r["via"] == "group_rule"] == ["Team Platform"]
     assert slack["complete"] is True
 
     request.reset_mock()
     expel = await pm._scan(ctx, object(), ["Team", "timeType"], app_name="expel")
     urls = [c.args[2] for c in request.call_args_list]
     assert not any(u.startswith("/api/v1/mappings/") for u in urls)
-    assert {r["via"] for r in expel["matches"]} == {"saml_attribute_statement"}
+    assert {r["via"] for r in expel["matches"]} == {"saml_attribute_statement", "group_rule"}
     assert expel["apps_by_attribute"] == {"Team": [], "timeType": ["Expel.io"]}
 
 

@@ -53,6 +53,9 @@ TOOL_SCOPE_REGISTRY: dict[str, str] = {
     "confirm_delete_group":                 "okta.groups.manage",
     "add_user_to_group":                    "okta.groups.manage",
     "remove_user_from_group":               "okta.groups.manage",
+    # Group rules (read-only)  (src/okta_mcp_server/tools/groups/group_rules.py)
+    "list_group_rules":                     "okta.groups.read",
+    "get_group_rule":                       "okta.groups.read",
     # ------------------------------------------------------------------
     # Applications  (src/okta_mcp_server/tools/applications/applications.py)
     # ------------------------------------------------------------------
@@ -189,7 +192,8 @@ TOOL_SCOPE_REGISTRY: dict[str, str] = {
     "get_app_request_condition":            "okta.accessRequests.condition.read",
     "list_catalog_entries":                 "okta.accessRequests.catalog.read",
     # ------------------------------------------------------------------
-    # Profile Mappings (read-only; the tool also requires okta.apps.read)
+    # Profile Mappings (read-only; the tool also requires okta.apps.read, and
+    # uses okta.groups.read for the optional group rules phase)
     # (src/okta_mcp_server/tools/governance/profile_mappings.py)
     # ------------------------------------------------------------------
     "find_profile_attribute_usage":         "okta.profileMappings.read",
